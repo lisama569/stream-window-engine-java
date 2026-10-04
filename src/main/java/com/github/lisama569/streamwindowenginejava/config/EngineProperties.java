@@ -23,6 +23,12 @@ public class EngineProperties {
     /** 保留的已确定窗口结果最大条数 */
     private int maxRetainedResults = 10_000;
 
+    /** 最大来源数量（含默认来源），超过则对新来源背压 */
+    private int maxSources = 4096;
+
+    /** 标记去重表最大条目数，超过则背压 */
+    private int maxMarkerEntries = 100_000;
+
     /** 检查点文件路径 */
     private String checkpointPath = "data/checkpoint.json";
 
@@ -39,6 +45,10 @@ public class EngineProperties {
     public void setMaxDedupEntries(int v) { this.maxDedupEntries = v; }
     public int getMaxRetainedResults() { return maxRetainedResults; }
     public void setMaxRetainedResults(int v) { this.maxRetainedResults = v; }
+    public int getMaxSources() { return maxSources; }
+    public void setMaxSources(int v) { this.maxSources = v; }
+    public int getMaxMarkerEntries() { return maxMarkerEntries; }
+    public void setMaxMarkerEntries(int v) { this.maxMarkerEntries = v; }
     public String getCheckpointPath() { return checkpointPath; }
     public void setCheckpointPath(String v) { this.checkpointPath = v; }
     public boolean isCheckpointRequired() { return checkpointRequired; }

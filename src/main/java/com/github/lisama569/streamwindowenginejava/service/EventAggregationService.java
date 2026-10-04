@@ -7,6 +7,8 @@ import com.github.lisama569.streamwindowenginejava.config.EngineProperties;
 import com.github.lisama569.streamwindowenginejava.core.WindowEngine;
 import com.github.lisama569.streamwindowenginejava.model.Event;
 import com.github.lisama569.streamwindowenginejava.model.IngestResult;
+import com.github.lisama569.streamwindowenginejava.model.MarkerResult;
+import com.github.lisama569.streamwindowenginejava.model.SourceMarker;
 import com.github.lisama569.streamwindowenginejava.model.WindowResult;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -16,6 +18,7 @@ import org.springframework.stereotype.Service;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -42,6 +45,8 @@ public class EventAggregationService {
                 properties.getMaxOpenWindows(),
                 properties.getMaxDedupEntries(),
                 properties.getMaxRetainedResults(),
+                properties.getMaxSources(),
+                properties.getMaxMarkerEntries(),
                 r -> log.info("window result emitted: {}", r));
     }
 
@@ -68,8 +73,16 @@ public class EventAggregationService {
         return engine.ingest(event);
     }
 
+    public MarkerResult ingestMarker(SourceMarker marker) {
+        return engine.ingestMarker(marker);
+    }
+
     public long currentWatermark() {
         return engine.currentWatermark();
+    }
+
+    public Map<String, Long> sourceWatermarks() {
+        return engine.sourceWatermarks();
     }
 
     public List<WindowResult> finalizedResults() {

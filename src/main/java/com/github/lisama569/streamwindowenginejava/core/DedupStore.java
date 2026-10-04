@@ -45,10 +45,23 @@ public class DedupStore {
 
     /** 回收事件时间 <= watermark 的条目，返回回收条数。 */
     public int pruneUpTo(long watermark) {
+        return pruneIf(t -> t <= watermark);
+    }
+
+    /**
+     * 严格回收：只回收时间 < watermark 的条目。
+     * 用于标记去重表：刚生效的标记其进度恰好等于水位，保留它才能让
+     * 紧随其后的重复提交被判为 DUPLICATE 而不是 STALE。
+     */
+    public int pruneBelow(long watermark) {
+        return pruneIf(t -> t < watermark);
+    }
+
+    private int pruneIf(java.util.function.LongPredicate shouldRemove) {
         int removed = 0;
         Iterator<Map.Entry<String, Long>> it = entries.entrySet().iterator();
         while (it.hasNext()) {
-            if (it.next().getValue() <= watermark) {
+            if (shouldRemove.test(it.next().getValue())) {
                 it.remove();
                 removed++;
             }

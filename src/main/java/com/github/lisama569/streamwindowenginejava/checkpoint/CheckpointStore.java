@@ -9,6 +9,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.Base64;
+import java.util.Map;
 import java.util.Optional;
 import java.util.zip.CRC32;
 
@@ -64,9 +65,12 @@ public class CheckpointStore {
             throw new CheckpointException("checkpoint file is corrupted (missing fields): " + checkpointFile);
         }
         int version = envelope.get("formatVersion").asInt();
-        if (version != CheckpointData.CURRENT_FORMAT_VERSION) {
+        if (version < CheckpointData.MIN_COMPATIBLE_FORMAT_VERSION
+                || version > CheckpointData.CURRENT_FORMAT_VERSION) {
             throw new CheckpointException("checkpoint format version " + version
-                    + " is incompatible with supported version " + CheckpointData.CURRENT_FORMAT_VERSION);
+                    + " is incompatible with supported versions "
+                    + CheckpointData.MIN_COMPATIBLE_FORMAT_VERSION + ".."
+                    + CheckpointData.CURRENT_FORMAT_VERSION);
         }
         byte[] payload;
         try {
@@ -80,9 +84,31 @@ public class CheckpointStore {
             throw new CheckpointException("checkpoint checksum mismatch, refusing to apply: " + checkpointFile);
         }
         try {
-            return Optional.of(mapper.readValue(payload, CheckpointData.class));
+            return Optional.of(migrate(mapper.readValue(payload, CheckpointData.class), version));
         } catch (IOException e) {
             throw new CheckpointException("checkpoint payload cannot be deserialized, refusing to apply", e);
         }
+    }
+
+    /**
+     * 版本迁移：v1 检查点无来源状态，按清晰规则兼容——全局水位归入默认来源、
+     * 标记去重表为空，恢复后与旧单路语义完全一致；v2 原样返回。
+     * 迁移要么整体完成要么整体拒绝，绝不只恢复一半。
+     */
+    private static CheckpointData migrate(CheckpointData data, int version) {
+        if (version == CheckpointData.CURRENT_FORMAT_VERSION
+                && data.sourceWatermarks() != null && data.markerDedupEntries() != null) {
+            return data;
+        }
+        Map<String, Long> sourceWatermarks = data.sourceWatermarks() != null
+                ? data.sourceWatermarks()
+                : Map.of(com.github.lisama569.streamwindowenginejava.core.SourceProgressTracker
+                        .DEFAULT_SOURCE_ID, data.watermark());
+        Map<String, Long> markerDedupEntries = data.markerDedupEntries() != null
+                ? data.markerDedupEntries()
+                : Map.of();
+        return new CheckpointData(CheckpointData.CURRENT_FORMAT_VERSION,
+                data.watermark(), data.dedupEntries(), data.openWindows(),
+                data.finalizedResults(), sourceWatermarks, markerDedupEntries);
     }
 }
