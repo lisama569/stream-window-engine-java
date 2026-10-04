@@ -7,6 +7,8 @@ import com.github.lisama569.streamwindowenginejava.config.EngineProperties;
 import com.github.lisama569.streamwindowenginejava.core.WindowEngine;
 import com.github.lisama569.streamwindowenginejava.model.Event;
 import com.github.lisama569.streamwindowenginejava.model.IngestResult;
+import com.github.lisama569.streamwindowenginejava.model.MarkerResult;
+import com.github.lisama569.streamwindowenginejava.model.SourceMarker;
 import com.github.lisama569.streamwindowenginejava.model.WindowResult;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -42,6 +44,7 @@ public class EventAggregationService {
                 properties.getMaxOpenWindows(),
                 properties.getMaxDedupEntries(),
                 properties.getMaxRetainedResults(),
+                properties.getMaxSources(),
                 r -> log.info("window result emitted: {}", r));
     }
 
@@ -68,6 +71,16 @@ public class EventAggregationService {
         return engine.ingest(event);
     }
 
+    /** 提交来源进度/空闲标记，结论可区分（APPLIED/DUPLICATE/STALE/BACKPRESSURE）。 */
+    public MarkerResult submitMarker(SourceMarker marker) {
+        return engine.submitMarker(marker);
+    }
+
+    /** 指定来源当前已知进度；未知来源返回 Long.MIN_VALUE。 */
+    public long sourceProgress(String sourceId) {
+        return engine.sourceProgress(sourceId);
+    }
+
     public long currentWatermark() {
         return engine.currentWatermark();
     }
@@ -79,8 +92,9 @@ public class EventAggregationService {
     public void checkpointNow() {
         CheckpointData data = engine.snapshot();
         checkpointStore.save(data);
-        log.info("checkpoint saved: watermark={} dedupEntries={} openWindows={} finalizedResults={}",
+        log.info("checkpoint saved: watermark={} dedupEntries={} openWindows={} finalizedResults={} sources={}",
                 data.watermark(), data.dedupEntries().size(),
-                data.openWindows().size(), data.finalizedResults().size());
+                data.openWindows().size(), data.finalizedResults().size(),
+                data.sourceProgress().size());
     }
 }

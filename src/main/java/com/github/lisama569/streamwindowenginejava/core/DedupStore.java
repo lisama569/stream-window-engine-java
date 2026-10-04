@@ -56,6 +56,11 @@ public class DedupStore {
         return removed;
     }
 
+    /** @return true 表示容量已满，再登记新条目将失败（背压预检） */
+    public boolean isFull() {
+        return entries.size() >= maxEntries;
+    }
+
     public int size() {
         return entries.size();
     }

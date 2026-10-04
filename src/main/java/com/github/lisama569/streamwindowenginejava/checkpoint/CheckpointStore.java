@@ -64,9 +64,12 @@ public class CheckpointStore {
             throw new CheckpointException("checkpoint file is corrupted (missing fields): " + checkpointFile);
         }
         int version = envelope.get("formatVersion").asInt();
-        if (version != CheckpointData.CURRENT_FORMAT_VERSION) {
+        if (version < CheckpointData.MIN_SUPPORTED_FORMAT_VERSION
+                || version > CheckpointData.CURRENT_FORMAT_VERSION) {
             throw new CheckpointException("checkpoint format version " + version
-                    + " is incompatible with supported version " + CheckpointData.CURRENT_FORMAT_VERSION);
+                    + " is incompatible with supported versions "
+                    + CheckpointData.MIN_SUPPORTED_FORMAT_VERSION + ".."
+                    + CheckpointData.CURRENT_FORMAT_VERSION);
         }
         byte[] payload;
         try {

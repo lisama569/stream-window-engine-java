@@ -2,9 +2,12 @@ package com.github.lisama569.streamwindowenginejava.api;
 
 import com.github.lisama569.streamwindowenginejava.model.Event;
 import com.github.lisama569.streamwindowenginejava.model.IngestResult;
+import com.github.lisama569.streamwindowenginejava.model.MarkerResult;
+import com.github.lisama569.streamwindowenginejava.model.SourceMarker;
 import com.github.lisama569.streamwindowenginejava.model.WindowResult;
 import com.github.lisama569.streamwindowenginejava.service.EventAggregationService;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -28,6 +31,16 @@ public class EventController {
     @PostMapping("/events")
     public IngestResult ingest(@RequestBody Event event) {
         return service.ingest(event);
+    }
+
+    @PostMapping("/markers")
+    public MarkerResult submitMarker(@RequestBody SourceMarker marker) {
+        return service.submitMarker(marker);
+    }
+
+    @GetMapping("/sources/{sourceId}/progress")
+    public long sourceProgress(@PathVariable String sourceId) {
+        return service.sourceProgress(sourceId);
     }
 
     @GetMapping("/watermark")

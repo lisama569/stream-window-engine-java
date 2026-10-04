@@ -20,6 +20,9 @@ public class EngineProperties {
     /** 去重表最大条目数，超过则背压 */
     private int maxDedupEntries = 100_000;
 
+    /** 同时跟踪的最大来源数，超过则背压 */
+    private int maxSources = 4096;
+
     /** 保留的已确定窗口结果最大条数 */
     private int maxRetainedResults = 10_000;
 
@@ -37,6 +40,8 @@ public class EngineProperties {
     public void setMaxOpenWindows(int v) { this.maxOpenWindows = v; }
     public int getMaxDedupEntries() { return maxDedupEntries; }
     public void setMaxDedupEntries(int v) { this.maxDedupEntries = v; }
+    public int getMaxSources() { return maxSources; }
+    public void setMaxSources(int v) { this.maxSources = v; }
     public int getMaxRetainedResults() { return maxRetainedResults; }
     public void setMaxRetainedResults(int v) { this.maxRetainedResults = v; }
     public String getCheckpointPath() { return checkpointPath; }
