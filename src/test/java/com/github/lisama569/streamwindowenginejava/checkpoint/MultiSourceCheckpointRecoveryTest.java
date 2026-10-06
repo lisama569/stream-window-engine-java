@@ -136,6 +136,87 @@ class MultiSourceCheckpointRecoveryTest {
     }
 
     @Test
+    void emptyCheckpointRestartDoesNotPinWatermark() {
+        Path file = dir.resolve("checkpoint.json");
+        CheckpointStore store = new CheckpointStore(file);
+
+        // 空跑进程：一条事件、一个标记都没有，正常关停落盘
+        WindowEngine emptyRun = newEngine();
+        store.save(emptyRun.snapshot());
+        CheckpointData saved = store.load().orElseThrow();
+        log.info("empty checkpoint saved: formatVersion={} watermark={} sources={}",
+                saved.formatVersion(), saved.watermark(), saved.sourceProgress());
+
+        // 重启后上游开始带来源标识发事件：水位必须正常推进、窗口按时定版
+        WindowEngine restarted = newEngine();
+        restarted.restore(saved);
+        assertEquals(0, restarted.sourceCount(),
+                "empty checkpoint must not resurrect a phantom source");
+        assertEquals(IngestStatus.ACCEPTED,
+                restarted.ingest(new Event("a1", "k", 5000, 1, "A")).status());
+        assertEquals(IngestStatus.ACCEPTED,
+                restarted.ingest(new Event("a2", "k", 10_000, 2, "A")).status());
+        log.info("after restart with sourced events: watermark={} sourceProgressA={}",
+                restarted.currentWatermark(), restarted.sourceProgress("A"));
+        assertEquals(10_000 - LATENESS, restarted.currentWatermark(),
+                "watermark must advance after empty-checkpoint restart");
+        assertEquals(MarkerStatus.APPLIED,
+                restarted.submitMarker(new SourceMarker("mA-1", "A", 20_000)).status());
+        List<WindowResult> results = restarted.finalizedResults();
+        results.forEach(r -> log.info("finalized after empty-checkpoint restart: {}", r));
+        assertTrue(results.stream().anyMatch(r -> r.windowStart() == 5000 && r.totalCount() == 1)
+                        && results.stream().anyMatch(r -> r.windowStart() == 10_000 && r.totalCount() == 1),
+                "both windows must finalize on time after empty-checkpoint restart");
+
+        // 同样的空检查点，换成不带来源的老用法也必须正常
+        WindowEngine legacy = newEngine();
+        legacy.restore(saved);
+        assertEquals(IngestStatus.ACCEPTED,
+                legacy.ingest(new Event("e1", "k", 7000, 1)).status());
+        assertEquals(7000 - LATENESS, legacy.currentWatermark(),
+                "legacy source-less usage must advance watermark after empty-checkpoint restart");
+        log.info("legacy usage after empty-checkpoint restart: watermark={}",
+                legacy.currentWatermark());
+    }
+
+    @Test
+    void eventAndMarkerDedupNamespacesStaySeparateAcrossRestart() {
+        Path file = dir.resolve("checkpoint.json");
+        CheckpointStore store = new CheckpointStore(file);
+
+        // 事件 "42"、事件 "M:42"（ID 携带标记前缀）与标记 "42" 共存后落盘
+        WindowEngine first = newEngine();
+        assertEquals(IngestStatus.ACCEPTED,
+                first.ingest(new Event("42", "k", 5000, 1, "A")).status());
+        assertEquals(MarkerStatus.APPLIED,
+                first.submitMarker(new SourceMarker("42", "B", 10_000)).status());
+        assertEquals(IngestStatus.ACCEPTED,
+                first.ingest(new Event("M:42", "k", 9500, 2, "A")).status());
+        store.save(first.snapshot());
+        log.info("checkpoint saved with colliding ids: watermark={} dedup={}",
+                first.currentWatermark(), first.snapshot().dedupEntries());
+
+        // 重启：三类条目各自判重，互不误判
+        WindowEngine recovered = newEngine();
+        recovered.restore(store.load().orElseThrow());
+        IngestResult dupEvent = recovered.ingest(new Event("M:42", "k", 9500, 2, "A"));
+        MarkerResult dupMarker = recovered.submitMarker(new SourceMarker("42", "B", 10_000));
+        log.info("after restart: resubmit event M:42 -> {} (dedup basis: eventId); "
+                        + "resubmit marker 42 -> {} (dedup basis: markerId)",
+                dupEvent.status(), dupMarker.status());
+        assertEquals(IngestStatus.DUPLICATE, dupEvent.status());
+        assertEquals(MarkerStatus.DUPLICATE, dupMarker.status());
+
+        // 新标记/新事件不受对方命名空间影响，正常生效
+        assertEquals(MarkerStatus.APPLIED,
+                recovered.submitMarker(new SourceMarker("M:42", "B", 20_000)).status());
+        assertEquals(IngestStatus.ACCEPTED,
+                recovered.ingest(new Event("43", "k", 15_000, 4, "A")).status());
+        log.info("after restart: watermark={} progressB={}",
+                recovered.currentWatermark(), recovered.sourceProgress("B"));
+    }
+
+    @Test
     void legacyV1CheckpointWithoutSourceProgressRestoresAsSingleSource() throws Exception {
         Path file = dir.resolve("checkpoint.json");
         // 手工构造 v1 格式检查点：没有 sourceProgress 字段

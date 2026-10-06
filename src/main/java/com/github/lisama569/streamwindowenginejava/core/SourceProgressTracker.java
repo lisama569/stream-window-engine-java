@@ -120,14 +120,23 @@ public class SourceProgressTracker {
 
     /**
      * 从检查点恢复。
-     * sourceProgress 为空（v1 旧格式，无来源信息）时，按清晰兼容规则重建：
-     * 以 watermark + allowedLateness 作为默认来源进度，与旧版
-     * WatermarkTracker.restore 语义一致，恢复后仍按单路语义工作。
+     *
+     * 兼容规则（严格按检查点格式版本区分，不越界套用）：
+     * - legacySingleSource=true（v1 旧格式，无来源进度字段）：sourceProgress 为空时
+     *   以 watermark + allowedLateness 重建默认来源进度，与旧版
+     *   WatermarkTracker.restore 语义一致，恢复后仍按单路语义工作；
+     * - legacySingleSource=false（v2+ 新格式）：sourceProgress 如实恢复；
+     *   空表表示空跑检查点（从未注册过任何来源），恢复后同样没有任何来源，
+     *   绝不虚构默认来源——否则该来源会以固定进度参与 min() 计算，
+     *   把水位永远钉死，导致重启后带来源的事件被接受但窗口永远不定版。
      */
-    public void restore(long watermark, Map<String, Long> sourceProgress) {
+    public void restore(long watermark, Map<String, Long> sourceProgress, boolean legacySingleSource) {
         progressBySource.clear();
         if (sourceProgress == null || sourceProgress.isEmpty()) {
-            progressBySource.put(DEFAULT_SOURCE, safeAdd(watermark));
+            if (legacySingleSource) {
+                progressBySource.put(DEFAULT_SOURCE, safeAdd(watermark));
+            }
+            // 新格式的空表：保持无任何来源，等真实事件/标记注册
         } else {
             progressBySource.putAll(sourceProgress);
         }

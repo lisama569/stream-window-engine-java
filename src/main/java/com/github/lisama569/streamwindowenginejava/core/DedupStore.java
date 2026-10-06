@@ -5,7 +5,9 @@ import java.util.Iterator;
 import java.util.Map;
 
 /**
- * 基于 eventId 的去重存储，记录 eventId -> eventTimeMillis。
+ * 去重存储，记录 去重键 -> 事件时间/进度时间。
+ * 键由调用方（WindowEngine）加上域前缀：事件 "E:<eventId>"、标记 "M:<markerId>"，
+ * 两个命名空间互不相交，事件与标记各自独立去重。
  * 条目随水位推进回收：事件时间 <= 水位的事件若再次到达，会被引擎判为 LATE_REJECTED，
  * 不可能被重复计入，因此其去重条目可以安全回收，内存不随事件总数无界增长。
  * 容量达到上限且回收后仍不足时，register 返回 false，由引擎施加背压。

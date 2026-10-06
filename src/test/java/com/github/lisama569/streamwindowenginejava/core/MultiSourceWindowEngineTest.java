@@ -267,6 +267,93 @@ class MultiSourceWindowEngineTest {
     }
 
     @Test
+    void eventAndMarkerIdsCollideButDeduplicateIndependently() {
+        // 上游各路来源各自分配编号：事件编号与另一路标记编号可以完全相同，
+        // 甚至事件 ID 本身携带 "M:" 前缀。两类去重命名空间必须互不影响。
+        WindowEngine engine = newEngine();
+
+        // 事件 "42" 先到：正常接受
+        assertEquals(IngestStatus.ACCEPTED,
+                engine.ingest(new Event("42", "k", 5000, 1, "A")).status());
+        // 另一路来源的标记 "42"：编号与事件相同，仍必须生效
+        MarkerResult m = engine.submitMarker(new SourceMarker("42", "B", 10_000));
+        log.info("marker id collides with event id: status={} reason={} progressB={} (dedup basis: markerId=42)",
+                m.status(), m.reason(), engine.sourceProgress("B"));
+        assertEquals(MarkerStatus.APPLIED, m.status(),
+                        "marker must not be rejected as duplicate of an event with the same id");
+        assertEquals(10_000, engine.sourceProgress("B"));
+
+        // 携带 "M:" 前缀的事件 ID 与标记 "42" 的内部去重键字面相同，也必须正常计入
+        // （水位 8000，事件时间 9500 仍在迟到视野内）
+        IngestResult prefixed = engine.ingest(new Event("M:42", "k", 9500, 2, "A"));
+        log.info("event id carrying marker prefix: status={} reason={} (dedup basis: eventId=M:42)",
+                prefixed.status(), prefixed.reason());
+        assertEquals(IngestStatus.ACCEPTED, prefixed.status(),
+                        "event must not be rejected as duplicate of a marker dedup key");
+
+        // 各自语义内的重复仍然成立：同 ID 事件/同 ID 标记再次提交判 DUPLICATE
+        // （重提 "M:42"：其事件时间 9500 仍在水位 8000 之上，可走到去重判定）
+        IngestResult dupEvent = engine.ingest(new Event("M:42", "k", 9500, 2, "A"));
+        MarkerResult dupMarker = engine.submitMarker(new SourceMarker("42", "B", 10_000));
+        log.info("true duplicates: event={} marker={} (dedup basis: same id, same kind)",
+                dupEvent.status(), dupMarker.status());
+        assertEquals(IngestStatus.DUPLICATE, dupEvent.status());
+        assertEquals(MarkerStatus.DUPLICATE, dupMarker.status());
+
+        // 反向顺序同样成立：标记先生效，同编号事件后到仍正常接受
+        WindowEngine reversed = newEngine();
+        assertEquals(MarkerStatus.APPLIED,
+                reversed.submitMarker(new SourceMarker("42", "B", 10_000)).status());
+        IngestResult lateEvent = reversed.ingest(new Event("42", "k", 9500, 1, "A"));
+        log.info("reversed order: event id collides with earlier marker id: status={} reason={}",
+                lateEvent.status(), lateEvent.reason());
+        assertEquals(IngestStatus.ACCEPTED, lateEvent.status());
+
+        // 反向 + 前缀：标记 "42" 先生效，事件 "M:42" 后到仍正常接受
+        IngestResult prefixedLate = reversed.ingest(new Event("M:42", "k", 9600, 1, "A"));
+        log.info("reversed order with prefixed event id: status={} reason={}",
+                prefixedLate.status(), prefixedLate.reason());
+        assertEquals(IngestStatus.ACCEPTED, prefixedLate.status());
+    }
+
+    @Test
+    void expiredMarkerFromUnknownSourceIsStaleAndDoesNotDragWatermark() {
+        WindowEngine engine = newEngine();
+        // 来源 A 正常推进：水位 8000
+        assertEquals(IngestStatus.ACCEPTED,
+                engine.ingest(new Event("a1", "k", 10_000, 1, "A")).status());
+        assertEquals(10_000 - LATENESS, engine.currentWatermark());
+
+        // 未知来源 C 发来明显落后的空闲标记：进度 100 早被水位越过
+        MarkerResult stale = engine.submitMarker(new SourceMarker("mC-1", "C", 100));
+        log.info("expired marker from unknown source: status={} reason={} watermark={} sources={}",
+                stale.status(), stale.reason(), engine.currentWatermark(), engine.sourceCount());
+        assertEquals(MarkerStatus.STALE, stale.status(),
+                        "expired/conflicting marker must be distinguishable as STALE");
+        assertEquals(10_000 - LATENESS, engine.currentWatermark(),
+                        "stale marker must not move the watermark");
+        assertEquals(1, engine.sourceCount(),
+                        "stale marker must not register its source and drag the min() progress");
+
+        // 其它来源继续推进：水位按时前进、窗口按时定版，不被 C 拖住
+        assertEquals(IngestStatus.ACCEPTED,
+                engine.ingest(new Event("a2", "k", 20_000, 2, "A")).status());
+        log.info("after A advances: watermark={} finalized={}",
+                engine.currentWatermark(), engine.finalizedResults());
+        assertEquals(20_000 - LATENESS, engine.currentWatermark());
+        assertTrue(engine.finalizedResults().stream()
+                        .anyMatch(r -> r.windowStart() == 10_000),
+                "window [10000,11000) must finalize on time");
+
+        // 未知来源的正常标记（进度领先水位）仍然生效：加入多来源语义不受影响
+        MarkerResult fresh = engine.submitMarker(new SourceMarker("mD-1", "D", 30_000));
+        log.info("fresh marker from unknown source: status={} progressD={}",
+                fresh.status(), engine.sourceProgress("D"));
+        assertEquals(MarkerStatus.APPLIED, fresh.status());
+        assertEquals(2, engine.sourceCount());
+    }
+
+    @Test
     void sourceLimitAppliesDistinguishableBackpressure() {
         WindowEngine engine = new WindowEngine(WINDOW, LATENESS, 1024, 100_000, 10_000, 2,
                 r -> log.info("listener observed window result: {}", r));

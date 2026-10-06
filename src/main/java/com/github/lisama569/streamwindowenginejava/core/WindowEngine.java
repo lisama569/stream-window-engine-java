@@ -98,9 +98,10 @@ public class WindowEngine {
                 return IngestResult.of(IngestStatus.LATE_REJECTED,
                         "eventTime " + event.eventTimeMillis() + " <= watermark " + watermark);
             }
-            if (dedupStore.isDuplicate(event.eventId(), event.eventTimeMillis())) {
-                log.info("ingest DUPLICATE eventId={} source={} (dedup by eventId)",
-                        event.eventId(), event.sourceId());
+            String dedupKey = eventDedupKey(event.eventId());
+            if (dedupStore.isDuplicate(dedupKey, event.eventTimeMillis())) {
+                log.info("ingest DUPLICATE eventId={} source={} (dedup by eventId, key={})",
+                        event.eventId(), event.sourceId(), dedupKey);
                 return IngestResult.of(IngestStatus.DUPLICATE,
                         "duplicate eventId " + event.eventId());
             }
@@ -123,7 +124,7 @@ public class WindowEngine {
                 return IngestResult.of(IngestStatus.BACKPRESSURE,
                         "open windows limit reached: " + maxOpenWindows);
             }
-            if (!dedupStore.register(event.eventId(), event.eventTimeMillis())) {
+            if (!dedupStore.register(dedupKey, event.eventTimeMillis())) {
                 log.info("ingest BACKPRESSURE eventId={} dedup store full", event.eventId());
                 return IngestResult.of(IngestStatus.BACKPRESSURE,
                         "dedup store limit reached");
@@ -195,11 +196,14 @@ public class WindowEngine {
      *
      * 结论互相可区分且幂等：
      * - 重复 markerId -> DUPLICATE，不重复推进；
-     * - 进度不领先于该来源已知进度（过期/互相矛盾）-> STALE，不生效；
+     * - 进度不领先于该来源已知进度，或进度已被全局水位越过（过期/互相矛盾，
+     *   典型如未知来源发来的落后空闲标记）-> STALE，不生效、不注册来源、
+     *   绝不因此拖住其它来源；
      * - 来源数或去重表达上限 -> BACKPRESSURE，不生效，可重试；
      * - 生效 -> APPLIED，来源进度推进，可能触发窗口确定。
-     * 标记去重条目以 "M:" 前缀与事件去重条目共存于同一去重表，
-     * 随水位一同回收、一同进入检查点，重启后重复标记仍判 DUPLICATE。
+     * 标记去重条目（"M:" 前缀）与事件去重条目（"E:" 前缀）共存于同一去重表，
+     * 两个命名空间互不相交；条目随水位一同回收、一同进入检查点，
+     * 重启后重复标记仍判 DUPLICATE。
      */
     public MarkerResult submitMarker(SourceMarker marker) {
         if (marker == null || marker.markerId() == null || marker.markerId().isBlank()) {
@@ -214,8 +218,14 @@ public class WindowEngine {
                 return MarkerResult.of(MarkerStatus.DUPLICATE,
                         "duplicate markerId " + marker.markerId());
             }
-            // 过期/矛盾判定先于来源登记：未生效的标记不得留下空进度来源拖住水位
+            // 过期/矛盾判定先于来源登记：未生效的标记不得留下空进度来源拖住水位。
+            // 两类过期情形都判 STALE：
+            // 1) 进度不领先于该来源已知进度（重复推进或互相矛盾）；
+            // 2) 进度已被全局水位越过——典型如未知来源发来的明显落后的空闲标记。
+            //    它声明的进度早已体现在已定版的窗口结论里，若生效会把该来源以
+            //    落后进度注册进 min() 计算，把整体水位钉死、拖住所有其它来源。
             long knownProgress = progressTracker.sourceProgress(marker.sourceId());
+            long watermarkNow = progressTracker.currentWatermark();
             if (marker.progressTimeMillis() <= knownProgress) {
                 log.info("marker STALE markerId={} source={} progressTime={} <= knownProgress={}",
                         marker.markerId(), marker.sourceId(),
@@ -223,6 +233,15 @@ public class WindowEngine {
                 return MarkerResult.of(MarkerStatus.STALE,
                         "progressTime " + marker.progressTimeMillis()
                                 + " <= known source progress " + knownProgress);
+            }
+            if (marker.progressTimeMillis() <= watermarkNow) {
+                log.info("marker STALE markerId={} source={} progressTime={} <= watermark={} "
+                                + "(expired/conflicting marker, source not registered)",
+                        marker.markerId(), marker.sourceId(),
+                        marker.progressTimeMillis(), watermarkNow);
+                return MarkerResult.of(MarkerStatus.STALE,
+                        "progressTime " + marker.progressTimeMillis()
+                                + " already passed by watermark " + watermarkNow);
             }
             // 背压预检也都先于来源登记，保证未生效的标记不改变任何状态
             if (dedupStore.isFull()) {
@@ -251,8 +270,36 @@ public class WindowEngine {
         }
     }
 
+    /**
+     * 事件与标记的去重键分别带 "E:" / "M:" 域前缀：两个命名空间首字符即不同，
+     * 因此无论 eventId 与 markerId 如何相同、甚至事件 ID 本身携带 "M:" 前缀，
+     * 两类条目都绝不互相干扰——正常标记不会被误判成重复事件，正常事件也不会
+     * 被误判成重复标记。
+     */
+    static String eventDedupKey(String eventId) {
+        return "E:" + eventId;
+    }
+
     static String markerDedupKey(String markerId) {
         return "M:" + markerId;
+    }
+
+    /**
+     * 旧格式（v1/v2）去重表迁移：当时事件条目为原始 eventId、标记条目带 "M:" 前缀，
+     * 恢复时把不带 "M:" 前缀的条目补上 "E:" 事件域前缀，与 v3 的键空间对齐。
+     * 已知边界：v1/v2 中恰好以 "M:" 开头的 eventId 与标记条目无法区分，按标记处理
+     * （仅影响该极端遗留数据，v3 起两个命名空间彻底隔离，不再存在此问题）。
+     */
+    private static Map<String, Long> migrateDedupEntries(int formatVersion, Map<String, Long> entries) {
+        if (formatVersion >= CheckpointData.SCOPED_DEDUP_KEYS_SINCE_VERSION) {
+            return entries;
+        }
+        Map<String, Long> migrated = new HashMap<>(Math.max(16, entries.size() * 2));
+        for (Map.Entry<String, Long> e : entries.entrySet()) {
+            String key = e.getKey();
+            migrated.put(key.startsWith("M:") ? key : eventDedupKey(key), e.getValue());
+        }
+        return migrated;
     }
 
     /** 指定来源当前已知进度（事件时间语义）；未知来源返回 Long.MIN_VALUE。 */
@@ -327,8 +374,11 @@ public class WindowEngine {
     public void restore(CheckpointData data) {
         lock.lock();
         try {
-            progressTracker.restore(data.watermark(), data.sourceProgress());
-            dedupStore.restore(data.dedupEntries());
+            // 仅 v1 旧格式（无来源进度字段）才套用单路兼容重建；
+            // v2+ 的空来源表是合法的空跑检查点，如实恢复，不虚构来源
+            boolean legacySingleSource = data.formatVersion() < CheckpointData.SOURCE_PROGRESS_SINCE_VERSION;
+            progressTracker.restore(data.watermark(), data.sourceProgress(), legacySingleSource);
+            dedupStore.restore(migrateDedupEntries(data.formatVersion(), data.dedupEntries()));
             openWindows.clear();
             for (Map.Entry<Long, Map<String, long[]>> e : data.openWindows().entrySet()) {
                 Map<String, long[]> inner = new HashMap<>();
