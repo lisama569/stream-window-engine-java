@@ -32,7 +32,8 @@ import java.util.function.Consumer;
  *   其它来源已满足条件的窗口结论；不带来源信息的事件归入默认来源，
  *   单来源时语义与旧版完全一致；
  * - 事件时间 <= 水位的事件判为 LATE_REJECTED，不计入也不静默丢弃（结论可区分）；
- * - eventId 重复的事件判为 DUPLICATE，不重复计数；
+ * - eventId 重复的事件判为 DUPLICATE，不重复计数；事件与标记使用各自独立的
+ *   去重表，eventId 与 markerId 即使相同也互不影响；
  * - 窗口结束时间 <= 水位时窗口确定，结果只取决于被接受事件的集合，与到达顺序无关；
  * - 打开窗口数与去重表均有上限，触限时返回 BACKPRESSURE，不丢数据、不崩溃；
  * - 已关闭窗口状态与过期去重条目随水位推进回收，内存不随事件总数无界增长。
@@ -47,7 +48,10 @@ public class WindowEngine {
     private final int maxOpenWindows;
     private final int maxRetainedResults;
     private final SourceProgressTracker progressTracker;
-    private final DedupStore dedupStore;
+    /** 事件去重表：只按 eventId 去重 */
+    private final DedupStore eventDedupStore;
+    /** 标记去重表：只按 markerId 去重，与事件去重完全独立，编号互撞互不影响 */
+    private final DedupStore markerDedupStore;
     private final Consumer<WindowResult> resultListener;
 
     /** windowStart -> (key -> [count, valueSum]) */
@@ -80,7 +84,8 @@ public class WindowEngine {
         this.maxOpenWindows = maxOpenWindows;
         this.maxRetainedResults = maxRetainedResults;
         this.progressTracker = new SourceProgressTracker(allowedLatenessMillis, maxSources);
-        this.dedupStore = new DedupStore(maxDedupEntries);
+        this.eventDedupStore = new DedupStore(maxDedupEntries);
+        this.markerDedupStore = new DedupStore(maxDedupEntries);
         this.resultListener = resultListener != null ? resultListener : r -> { };
     }
 
@@ -98,7 +103,7 @@ public class WindowEngine {
                 return IngestResult.of(IngestStatus.LATE_REJECTED,
                         "eventTime " + event.eventTimeMillis() + " <= watermark " + watermark);
             }
-            if (dedupStore.isDuplicate(event.eventId(), event.eventTimeMillis())) {
+            if (eventDedupStore.isDuplicate(event.eventId(), event.eventTimeMillis())) {
                 log.info("ingest DUPLICATE eventId={} source={} (dedup by eventId)",
                         event.eventId(), event.sourceId());
                 return IngestResult.of(IngestStatus.DUPLICATE,
@@ -123,7 +128,7 @@ public class WindowEngine {
                 return IngestResult.of(IngestStatus.BACKPRESSURE,
                         "open windows limit reached: " + maxOpenWindows);
             }
-            if (!dedupStore.register(event.eventId(), event.eventTimeMillis())) {
+            if (!eventDedupStore.register(event.eventId(), event.eventTimeMillis())) {
                 log.info("ingest BACKPRESSURE eventId={} dedup store full", event.eventId());
                 return IngestResult.of(IngestStatus.BACKPRESSURE,
                         "dedup store limit reached");
@@ -174,10 +179,10 @@ public class WindowEngine {
                     result.windowStart(), result.windowEnd(), totalCount, totalValue, countByKey, watermark);
             resultListener.accept(result);
         }
-        int pruned = dedupStore.pruneUpTo(watermark);
+        int pruned = eventDedupStore.pruneUpTo(watermark) + markerDedupStore.pruneUpTo(watermark);
         if (pruned > 0) {
             log.info("dedup pruned {} entries up to watermark={}, remaining={}",
-                    pruned, watermark, dedupStore.size());
+                    pruned, watermark, eventDedupStore.size() + markerDedupStore.size());
         }
     }
 
@@ -195,11 +200,14 @@ public class WindowEngine {
      *
      * 结论互相可区分且幂等：
      * - 重复 markerId -> DUPLICATE，不重复推进；
-     * - 进度不领先于该来源已知进度（过期/互相矛盾）-> STALE，不生效；
+     * - 进度不领先于该来源已知进度，或不领先于当前全局水位
+     *   （过期/互相矛盾，如未知来源发来的过期空闲标记）-> STALE，
+     *   不生效也不登记来源，不会拖住其它来源的水位；
      * - 来源数或去重表达上限 -> BACKPRESSURE，不生效，可重试；
      * - 生效 -> APPLIED，来源进度推进，可能触发窗口确定。
-     * 标记去重条目以 "M:" 前缀与事件去重条目共存于同一去重表，
-     * 随水位一同回收、一同进入检查点，重启后重复标记仍判 DUPLICATE。
+     * 标记去重与事件去重使用各自独立的去重表：markerId 与 eventId 即使相同
+     * 也互不影响，各自按自身语义去重；两张表都随水位回收、都进入检查点，
+     * 重启后重复标记仍判 DUPLICATE。
      */
     public MarkerResult submitMarker(SourceMarker marker) {
         if (marker == null || marker.markerId() == null || marker.markerId().isBlank()) {
@@ -207,25 +215,34 @@ public class WindowEngine {
         }
         lock.lock();
         try {
-            String dedupKey = markerDedupKey(marker.markerId());
-            if (dedupStore.isDuplicate(dedupKey, marker.progressTimeMillis())) {
+            // 标记去重表与事件去重表各自独立：markerId 与 eventId 即使相同也互不影响
+            if (markerDedupStore.isDuplicate(marker.markerId(), marker.progressTimeMillis())) {
                 log.info("marker DUPLICATE markerId={} source={} (dedup by markerId)",
                         marker.markerId(), marker.sourceId());
                 return MarkerResult.of(MarkerStatus.DUPLICATE,
                         "duplicate markerId " + marker.markerId());
             }
-            // 过期/矛盾判定先于来源登记：未生效的标记不得留下空进度来源拖住水位
+            // 过期/矛盾判定先于来源登记：未生效的标记不得留下空进度来源拖住水位。
+            // 两类过期都要拦截：
+            // 1) 不领先于该来源已知进度（重复推进或矛盾）；
+            // 2) 不领先于当前全局水位——典型如一个从未出现过的来源发来明显落后的
+            //    空闲标记：若生效，该来源会以过期进度参与 min 运算，把水位永远
+            //    钉死在低位，拖住其它所有来源。水位单调不减，这种标记不可能再
+            //    推进任何东西，判 STALE 且不登记来源。
             long knownProgress = progressTracker.sourceProgress(marker.sourceId());
-            if (marker.progressTimeMillis() <= knownProgress) {
-                log.info("marker STALE markerId={} source={} progressTime={} <= knownProgress={}",
-                        marker.markerId(), marker.sourceId(),
-                        marker.progressTimeMillis(), knownProgress);
+            long watermark = progressTracker.currentWatermark();
+            if (marker.progressTimeMillis() <= knownProgress
+                    || marker.progressTimeMillis() <= watermark) {
+                log.info("marker STALE markerId={} source={} progressTime={} knownProgress={} watermark={}",
+                        marker.markerId(), marker.sourceId(), marker.progressTimeMillis(),
+                        knownProgress, watermark);
                 return MarkerResult.of(MarkerStatus.STALE,
                         "progressTime " + marker.progressTimeMillis()
-                                + " <= known source progress " + knownProgress);
+                                + " <= known source progress " + knownProgress
+                                + " or current watermark " + watermark);
             }
             // 背压预检也都先于来源登记，保证未生效的标记不改变任何状态
-            if (dedupStore.isFull()) {
+            if (markerDedupStore.isFull()) {
                 log.info("marker BACKPRESSURE markerId={} dedup store full", marker.markerId());
                 return MarkerResult.of(MarkerStatus.BACKPRESSURE,
                         "dedup store limit reached");
@@ -237,9 +254,9 @@ public class WindowEngine {
                         "source limit reached: " + progressTracker.sourceCount());
             }
             // 预检均已通过且持同一把锁，以下两步必然成功
-            dedupStore.register(dedupKey, marker.progressTimeMillis());
+            markerDedupStore.register(marker.markerId(), marker.progressTimeMillis());
             progressTracker.applyMarker(marker.sourceId(), marker.progressTimeMillis());
-            long watermark = progressTracker.currentWatermark();
+            watermark = progressTracker.currentWatermark();
             log.info("marker APPLIED markerId={} source={} progressTime={} watermark={}",
                     marker.markerId(), marker.sourceId(),
                     marker.progressTimeMillis(), watermark);
@@ -251,9 +268,8 @@ public class WindowEngine {
         }
     }
 
-    static String markerDedupKey(String markerId) {
-        return "M:" + markerId;
-    }
+    /** v1/v2 旧格式检查点中标记去重条目混入事件去重表时使用的前缀，仅用于恢复旧数据。 */
+    static final String LEGACY_MARKER_DEDUP_PREFIX = "M:";
 
     /** 指定来源当前已知进度（事件时间语义）；未知来源返回 Long.MIN_VALUE。 */
     public long sourceProgress(String sourceId) {
@@ -295,7 +311,7 @@ public class WindowEngine {
     public int dedupSize() {
         lock.lock();
         try {
-            return dedupStore.size();
+            return eventDedupStore.size() + markerDedupStore.size();
         } finally {
             lock.unlock();
         }
@@ -315,10 +331,11 @@ public class WindowEngine {
             return new CheckpointData(
                     CheckpointData.CURRENT_FORMAT_VERSION,
                     progressTracker.currentWatermark(),
-                    dedupStore.snapshot(),
+                    eventDedupStore.snapshot(),
                     windowsCopy,
                     List.copyOf(finalizedResults),
-                    progressTracker.snapshot());
+                    progressTracker.snapshot(),
+                    markerDedupStore.snapshot());
         } finally {
             lock.unlock();
         }
@@ -328,7 +345,7 @@ public class WindowEngine {
         lock.lock();
         try {
             progressTracker.restore(data.watermark(), data.sourceProgress());
-            dedupStore.restore(data.dedupEntries());
+            restoreDedup(data);
             openWindows.clear();
             for (Map.Entry<Long, Map<String, long[]>> e : data.openWindows().entrySet()) {
                 Map<String, long[]> inner = new HashMap<>();
@@ -339,10 +356,43 @@ public class WindowEngine {
             }
             finalizedResults.clear();
             finalizedResults.addAll(data.finalizedResults());
-            log.info("engine restored from checkpoint: watermark={} dedupEntries={} openWindows={} finalizedResults={}",
-                    data.watermark(), data.dedupEntries().size(), openWindows.size(), finalizedResults.size());
+            log.info("engine restored from checkpoint: formatVersion={} watermark={} "
+                            + "eventDedupEntries={} markerDedupEntries={} openWindows={} finalizedResults={}",
+                    data.formatVersion(), data.watermark(), eventDedupStore.size(),
+                    markerDedupStore.size(), openWindows.size(), finalizedResults.size());
         } finally {
             lock.unlock();
+        }
+    }
+
+    /**
+     * 恢复去重表。v3 起事件与标记去重分表存储，直接恢复；
+     * v1/v2 旧格式只有一张混合表（标记条目以 "M:" 前缀混入），
+     * 按前缀拆分到两张独立的表，拆分后两类编号互不影响。
+     */
+    private void restoreDedup(CheckpointData data) {
+        if (data.formatVersion() >= 3) {
+            eventDedupStore.restore(data.dedupEntries());
+            markerDedupStore.restore(data.markerDedupEntries());
+            return;
+        }
+        Map<String, Long> eventEntries = new HashMap<>();
+        Map<String, Long> markerEntries = new HashMap<>();
+        for (Map.Entry<String, Long> e : data.dedupEntries().entrySet()) {
+            if (e.getKey().startsWith(LEGACY_MARKER_DEDUP_PREFIX)) {
+                markerEntries.put(e.getKey().substring(LEGACY_MARKER_DEDUP_PREFIX.length()),
+                        e.getValue());
+            } else {
+                eventEntries.put(e.getKey(), e.getValue());
+            }
+        }
+        eventDedupStore.restore(eventEntries);
+        markerDedupStore.restore(markerEntries);
+        if (!markerEntries.isEmpty()) {
+            log.info("legacy checkpoint (formatVersion={}) dedup entries split: {} event entries, "
+                            + "{} marker entries (\"{}\" prefix)",
+                    data.formatVersion(), eventEntries.size(), markerEntries.size(),
+                    LEGACY_MARKER_DEDUP_PREFIX);
         }
     }
 }

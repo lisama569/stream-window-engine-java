@@ -92,9 +92,11 @@ public class EventAggregationService {
     public void checkpointNow() {
         CheckpointData data = engine.snapshot();
         checkpointStore.save(data);
-        log.info("checkpoint saved: watermark={} dedupEntries={} openWindows={} finalizedResults={} sources={}",
-                data.watermark(), data.dedupEntries().size(),
+        log.info("checkpoint saved: formatVersion={} watermark={} eventDedupEntries={} "
+                        + "markerDedupEntries={} openWindows={} finalizedResults={} sources={}",
+                data.formatVersion(), data.watermark(), data.dedupEntries().size(),
+                data.markerDedupEntries().size(),
                 data.openWindows().size(), data.finalizedResults().size(),
-                data.sourceProgress().size());
+                data.sourceProgress() == null ? 0 : data.sourceProgress().size());
     }
 }

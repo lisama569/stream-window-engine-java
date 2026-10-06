@@ -267,6 +267,113 @@ class MultiSourceWindowEngineTest {
     }
 
     @Test
+    void eventAndMarkerDedupAreIndependentEvenWithCollidingIds() {
+        WindowEngine engine = newEngine();
+        // 一路事件的编号与另一路标记的编号完全相同：各自按自身语义处理
+        assertEquals(IngestStatus.ACCEPTED,
+                engine.ingest(new Event("42", "k", 3000, 1, "A")).status());
+        MarkerResult marker = engine.submitMarker(new SourceMarker("42", "B", 5000));
+        log.info("marker id collides with eventId: status={} reason={} (dedup basis: markerId=42)",
+                marker.status(), marker.reason());
+        assertEquals(MarkerStatus.APPLIED, marker.status(),
+                "marker id colliding with an eventId must still apply");
+        assertEquals(5000, engine.sourceProgress("B"));
+
+        // 反向：标记先登记，同编号事件也不能被误判成重复
+        assertEquals(MarkerStatus.APPLIED,
+                engine.submitMarker(new SourceMarker("77", "A", 6000)).status());
+        IngestResult event = engine.ingest(new Event("77", "k", 4500, 4, "A"));
+        log.info("event id collides with markerId: status={} reason={} (dedup basis: eventId=77)",
+                event.status(), event.reason());
+        assertEquals(IngestStatus.ACCEPTED, event.status(),
+                "event id colliding with a markerId must not be dropped as duplicate");
+
+        // 极端碰撞：eventId 恰好等于旧版标记去重键（"M:" 前缀），同样互不影响
+        assertEquals(IngestStatus.ACCEPTED,
+                engine.ingest(new Event("M:77", "k", 4600, 8, "A")).status());
+
+        // 各自的去重仍然生效：重复事件（水位之上，命中事件去重表）、
+        // 重复标记都可区分；已被水位越过的重投则判 LATE_REJECTED，同样不重复计数
+        IngestResult dupEvent = engine.ingest(new Event("77", "k", 4500, 4, "A"));
+        log.info("resubmit event 77 -> {} ({}) (dedup basis: eventId)",
+                dupEvent.status(), dupEvent.reason());
+        assertEquals(IngestStatus.DUPLICATE, dupEvent.status());
+        assertEquals(IngestStatus.LATE_REJECTED,
+                engine.ingest(new Event("42", "k", 3000, 1, "A")).status());
+        assertEquals(MarkerStatus.DUPLICATE,
+                engine.submitMarker(new SourceMarker("42", "B", 5000)).status());
+
+        // 收尾定版，核对窗口结果只包含被接受的三条事件
+        assertEquals(MarkerStatus.APPLIED,
+                engine.submitMarker(new SourceMarker("mA-final", "A", 20_000)).status());
+        assertEquals(MarkerStatus.APPLIED,
+                engine.submitMarker(new SourceMarker("mB-final", "B", 20_000)).status());
+        List<WindowResult> results = sorted(engine.finalizedResults());
+        results.forEach(r -> log.info("finalized with colliding ids: {}", r));
+        assertEquals(2, results.size());
+        assertEquals(3000, results.get(0).windowStart());
+        assertEquals(1, results.get(0).totalCount(), "only event 42@3000");
+        assertEquals(4000, results.get(1).windowStart());
+        assertEquals(2, results.get(1).totalCount(), "events 77@4500 and M:77@4600");
+        assertEquals(12, results.get(1).totalValue());
+    }
+
+    @Test
+    void staleMarkerFromUnknownSourceIsRejectedAndDoesNotBlockOthers() {
+        WindowEngine engine = newEngine();
+        assertEquals(IngestStatus.ACCEPTED,
+                engine.ingest(new Event("a1", "k", 2100, 1, "A")).status());
+        assertEquals(IngestStatus.ACCEPTED,
+                engine.ingest(new Event("b1", "k", 2200, 2, "B")).status());
+        assertEquals(MarkerStatus.APPLIED,
+                engine.submitMarker(new SourceMarker("mA-1", "A", 10_000)).status());
+        assertEquals(MarkerStatus.APPLIED,
+                engine.submitMarker(new SourceMarker("mB-1", "B", 10_000)).status());
+        long watermark = engine.currentWatermark();
+        log.info("before stale marker: watermark={} sources={} finalized={}",
+                watermark, engine.sourceCount(), engine.finalizedResults().size());
+        assertEquals(10_000 - LATENESS, watermark);
+        assertEquals(1, engine.finalizedResults().size(),
+                "window [2000,3000) must be finalized before the stale marker arrives");
+
+        // 从未出现过的来源发来明显落后于水位的空闲标记：
+        // 不生效、结论可区分（STALE）、不登记来源、不拖住水位
+        MarkerResult stale = engine.submitMarker(new SourceMarker("mX-1", "X", 1000));
+        log.info("stale marker from unknown source: status={} reason={} watermark={}",
+                stale.status(), stale.reason(), engine.currentWatermark());
+        assertEquals(MarkerStatus.STALE, stale.status());
+        assertEquals(watermark, engine.currentWatermark(),
+                "stale marker must not move the watermark");
+        assertEquals(2, engine.sourceCount(), "stale marker must not register its source");
+        assertEquals(Long.MIN_VALUE, engine.sourceProgress("X"));
+
+        // 边界：恰好等于当前水位同样判 STALE
+        assertEquals(MarkerStatus.STALE,
+                engine.submitMarker(new SourceMarker("mX-2", "X", watermark)).status());
+        assertEquals(2, engine.sourceCount());
+
+        // 其它来源继续推进不受拖累，后续窗口按时定版
+        assertEquals(IngestStatus.ACCEPTED,
+                engine.ingest(new Event("a2", "k", 11_000, 4, "A")).status());
+        assertEquals(IngestStatus.ACCEPTED,
+                engine.ingest(new Event("b2", "k", 11_500, 8, "B")).status());
+        assertEquals(MarkerStatus.APPLIED,
+                engine.submitMarker(new SourceMarker("mA-2", "A", 20_000)).status());
+        assertEquals(MarkerStatus.APPLIED,
+                engine.submitMarker(new SourceMarker("mB-2", "B", 20_000)).status());
+        log.info("after others advance: watermark={} sources={}",
+                engine.currentWatermark(), engine.sourceCount());
+        assertEquals(20_000 - LATENESS, engine.currentWatermark());
+
+        List<WindowResult> results = sorted(engine.finalizedResults());
+        results.forEach(r -> log.info("finalized after stale marker rejected: {}", r));
+        assertEquals(2, results.size());
+        assertEquals(2000, results.get(0).windowStart());
+        assertEquals(11_000, results.get(1).windowStart());
+        assertEquals(2, results.get(1).totalCount(), "a2 and b2 must both be counted");
+    }
+
+    @Test
     void sourceLimitAppliesDistinguishableBackpressure() {
         WindowEngine engine = new WindowEngine(WINDOW, LATENESS, 1024, 100_000, 10_000, 2,
                 r -> log.info("listener observed window result: {}", r));
